@@ -1,0 +1,442 @@
+graph:
+  id: gagasan_agung_ollama
+  description: >
+    Multi-agent research ideation lab (12 ideas -> attack -> refine Top-5 -> rank),
+    with optional web browsing and an optional repeat loop. Optimized for local
+    Ollama models with multi-model support.
+  log_level: INFO
+  is_majority_voting: false
+
+  nodes:
+    # ── Loop limiter ──────────────────────────────────────────────────
+    - id: LoopCounter
+      type: loop_counter
+      description: Limits the ideation repeat loop to a maximum of 3 iterations.
+      context_window: 0
+      config:
+        max_iterations: 3
+        reset_on_emit: true
+        message: Maximum iteration limit reached. Proceeding to final output.
+
+    # ── Passthrough helpers ───────────────────────────────────────────
+    - id: FINAL
+      type: passthrough
+      description: Terminal passthrough node.
+      context_window: 0
+      config: {}
+
+    # ── Stage 0: Coordinator (intake + plan) ──────────────────────────
+    - id: Coordinator
+      type: agent
+      description: Orchestrator that normalizes user input and produces an execution plan.
+      context_window: 6
+      config:
+        name: ${EDITOR_MODEL}
+        provider: openai
+        base_url: ${OLLAMA_BASE_URL}
+        api_key: ${API_KEY}
+        params: {}
+        role: |-
+          You are the Orchestrator/Editor. Enforce STRICT output format and quality gates:
+          - No fluff.
+          - Every idea MUST include: (1) hard-to-fake experiment, (2) critical ablation,
+            (3) falsification criteria.
+          - Keep scope controlled and feasible on local compute.
+          You will also normalize the user input into a single "Seed Summary" object.
+
+          INPUT MODES:
+          Mode A (topic-only): FIELD/DOMAIN, TOPIC SEED, CONSTRAINTS.
+          Mode B (PDF-seeded): title/authors/venue/year + abstract + method + results + limitations + notes.
+
+          OUTPUT (STRICT):
+          1) Seed Summary (Mode, Field, Topic, Constraints, any PDF fields)
+          2) Execution Plan: list phases Round1..Round4 with what each agent will output
+        tooling: []
+        thinking:
+        memories: []
+        retry:
+
+    # ── Stage 1a: Problem Scoper ──────────────────────────────────────
+    - id: ProblemScoper
+      type: agent
+      description: Produces 3-5 precise, falsifiable problem statements from the Seed Summary.
+      context_window: 6
+      config:
+        name: ${BRAIN_MODEL}
+        provider: openai
+        base_url: ${OLLAMA_BASE_URL}
+        api_key: ${API_KEY}
+        params: {}
+        role: |-
+          Problem-Scoper.
+          From the Seed Summary, produce 3-5 precise problem statements.
+          For each: assumptions, success criteria, and scope boundaries.
+          Keep them falsifiable and experimentally grounded.
+          Output as bullets with unique IDs (P1..P5).
+        tooling: []
+        thinking:
+        memories: []
+        retry:
+
+    # ── Stage 1b: Gap Miner ───────────────────────────────────────────
+    - id: GapMiner
+      type: agent
+      description: Extracts unresolved limitations, missing ablations, and untested regimes.
+      context_window: 6
+      config:
+        name: ${BRAIN_MODEL}
+        provider: openai
+        base_url: ${OLLAMA_BASE_URL}
+        api_key: ${API_KEY}
+        params: {}
+        role: |-
+          Gap Miner (PDF-aware if Mode B).
+          Extract:
+          - unresolved limitations
+          - missing ablations
+          - questionable assumptions
+          - untested regimes
+          Map each gap -> hypothesis (G1..Gn), each with a direct falsification test.
+        tooling: []
+        thinking:
+        memories: []
+        retry:
+
+    # ── Stage 1c: Web Researcher (optional) ───────────────────────────
+    - id: WebResearcher
+      type: agent
+      description: Optional prior-art web search agent. Controlled by ENABLE_BROWSING var.
+      context_window: 6
+      config:
+        name: ${EDITOR_MODEL}
+        provider: openai
+        base_url: ${OLLAMA_BASE_URL}
+        api_key: ${API_KEY}
+        params: {}
+        role: |-
+          Optional Web Researcher.
+          ENABLE_BROWSING is "${ENABLE_BROWSING}".
+
+          If ENABLE_BROWSING is not "true":
+            - Do NOT browse. Output: "Browsing disabled; skipping prior-art check."
+          If ENABLE_BROWSING is "true":
+            - Use web_search to check: (1) closest prior art for top gaps, (2) standard baselines/metrics.
+            - Use read_webpage_content to fetch full text of promising results.
+            - Return bullet citations (title/venue/year + why relevant).
+            - Flag "already-known" risks and suggest novelty pivots.
+        tooling:
+          - type: function
+            config:
+              tools:
+                - name: web:All
+              timeout:
+        thinking:
+        memories: []
+        retry:
+
+    # ── Round 1: Methods Designer (divergent) ─────────────────────────
+    - id: MethodsDesigner_R1
+      type: agent
+      description: Generates exactly 12 raw research ideas with structured experimental plans.
+      context_window: 10
+      config:
+        name: ${BRAIN_MODEL}
+        provider: openai
+        base_url: ${OLLAMA_BASE_URL}
+        api_key: ${API_KEY}
+        params: {}
+        role: |-
+          Methods Designer — Round 1 (Divergent).
+          Generate EXACTLY 12 raw ideas. Each idea MUST include:
+          - problem_statement (precise)
+          - hypothesis (testable)
+          - falsification_criteria (what result disproves it)
+          - method_sketch (algorithm/pipeline)
+          - hard_to_fake_experiment (hidden split/trap regime/preregistered prediction/etc.)
+          - critical_ablation (confound-killing)
+          - week-1 minimal viable experiment (MVE)
+          - month-1 scale-up plan
+          - baselines (>=2)
+          - ablations (>=2)
+          - metrics + sanity checks
+
+          Output format:
+          Round 1 (Divergent): 12 raw ideas
+          I01..I12 with dense structured bullets.
+        tooling: []
+        thinking:
+        memories: []
+        retry:
+
+    # ── Round 2a: Red-Team Critic ─────────────────────────────────────
+    - id: RedTeamCritic_R2
+      type: agent
+      description: Attacks all 12 ideas for novelty, feasibility, and confound issues.
+      context_window: 10
+      config:
+        name: ${BRAIN_MODEL}
+        provider: openai
+        base_url: ${OLLAMA_BASE_URL}
+        api_key: ${API_KEY}
+        params: {}
+        role: |-
+          Novelty/Red-Team Critic — Round 2 (Attack).
+          Attack ALL 12 ideas: why incremental/already-known/confounded/likely to fail.
+          For each Ixx output:
+          - Verdict: KEEP / FIX / KILL
+          - The single most fatal flaw
+          - A stronger variant OR kill-criterion
+          Be ruthless.
+        tooling: []
+        thinking:
+        memories: []
+        retry:
+
+    # ── Round 2b: Feasibility Engineer ────────────────────────────────
+    - id: FeasibilityEngineer_R2
+      type: agent
+      description: Estimates data/compute/engineering needs and flags impractical ideas.
+      context_window: 10
+      config:
+        name: ${BRAIN_MODEL}
+        provider: openai
+        base_url: ${OLLAMA_BASE_URL}
+        api_key: ${API_KEY}
+        params: {}
+        role: |-
+          Feasibility Engineer — Round 2 (Feasibility flags).
+          For ALL 12 ideas, estimate:
+          - data needs
+          - compute/memory
+          - engineering effort
+          - failure modes
+          Mark: PRACTICAL / BORDERLINE / IMPRACTICAL
+          Provide a cheaper salvage variant for BORDERLINE/IMPRACTICAL.
+        tooling: []
+        thinking:
+        memories: []
+        retry:
+
+    # ── Round 2c: Evaluation Architect ────────────────────────────────
+    - id: EvaluationArchitect_R2
+      type: agent
+      description: Audits all 12 ideas for missing baselines, ablations, and statistical rigor.
+      context_window: 10
+      config:
+        name: ${BRAIN_MODEL}
+        provider: openai
+        base_url: ${OLLAMA_BASE_URL}
+        api_key: ${API_KEY}
+        params: {}
+        role: |-
+          Evaluation Architect — Round 2 (Audit).
+          For ALL 12 ideas, check missing:
+          - baselines
+          - ablations
+          - statistical test
+          - sanity check
+          - falsification criterion
+          Propose the minimum fixes required to make it publishable-grade.
+        tooling: []
+        thinking:
+        memories: []
+        retry:
+
+    # ── Rounds 3+4: Convergent Coordinator ────────────────────────────
+    - id: Coordinator_R3R4
+      type: agent
+      description: Converges surviving ideas into Top-5, ranks them, and decides REPEAT or DONE.
+      context_window: 14
+      config:
+        name: ${EDITOR_MODEL}
+        provider: openai
+        base_url: ${OLLAMA_BASE_URL}
+        api_key: ${API_KEY}
+        params: {}
+        role: |-
+          Coordinator — Round 3 (Convergent) + Round 4 (Rank).
+          Using Round 2 attacks + feasibility + eval audits:
+          1) Select and refine surviving ideas into EXACTLY 5 strong candidates.
+          2) Produce the strict "Ranked Top-5 (table)".
+          3) For each Top-5: 1-2 pages dense technical detail with:
+             - problem statement (precise)
+             - hypothesis + falsification criteria
+             - method sketch
+             - week-1 MVE + month-1 scale-up
+             - baselines + ablations + metrics + sanity checks
+             - data requirements and how to obtain/simulate
+             - risks + mitigations
+             - publishable takeaway if negative
+          4) Score each with rubric (0-5 each): Novelty, Feasibility, Testability, Impact, Clarity.
+          5) Provide one recommended direction + concrete next-action checklist.
+
+          End your message with a routing keyword on its own line:
+          - If you think another iteration would materially improve results: "REPEAT"
+          - Otherwise: "DONE"
+        tooling: []
+        thinking:
+        memories: []
+        retry:
+
+    # ── Final Writer ──────────────────────────────────────────────────
+    - id: FinalWriter
+      type: agent
+      description: Produces the final polished artifact with ranked ideas and next actions.
+      context_window: 12
+      config:
+        name: ${EDITOR_MODEL}
+        provider: openai
+        base_url: ${OLLAMA_BASE_URL}
+        api_key: ${API_KEY}
+        params: {}
+        role: |-
+          Final Writer.
+          Output ONLY the final artifact (no meta commentary), STRICT format:
+          - Ranked Top-5 table
+          - Top-5 detailed writeups
+          - One recommended direction + next-action checklist
+        tooling: []
+        thinking:
+        memories: []
+        retry:
+
+  edges:
+    # ── Linear pipeline: Coordinator -> ProblemScoper -> GapMiner -> WebResearcher ──
+    - from: Coordinator
+      to: ProblemScoper
+      trigger: true
+      carry_data: true
+      condition: 'true'
+
+    - from: ProblemScoper
+      to: GapMiner
+      trigger: true
+      carry_data: true
+      condition: 'true'
+
+    - from: GapMiner
+      to: WebResearcher
+      trigger: true
+      carry_data: true
+      condition: 'true'
+
+    # ── WebResearcher -> MethodsDesigner (keep web context) ───────────
+    - from: WebResearcher
+      to: MethodsDesigner_R1
+      trigger: true
+      carry_data: true
+      keep_message: true
+      condition: 'true'
+
+    # ── Round 1 -> Round 2 critics (sequential) ──────────────────────
+    - from: MethodsDesigner_R1
+      to: RedTeamCritic_R2
+      trigger: true
+      carry_data: true
+      condition: 'true'
+
+    - from: RedTeamCritic_R2
+      to: FeasibilityEngineer_R2
+      trigger: true
+      carry_data: true
+      condition: 'true'
+
+    - from: FeasibilityEngineer_R2
+      to: EvaluationArchitect_R2
+      trigger: true
+      carry_data: true
+      condition: 'true'
+
+    # ── Round 2 -> Round 3+4 convergence ─────────────────────────────
+    - from: EvaluationArchitect_R2
+      to: Coordinator_R3R4
+      trigger: true
+      carry_data: true
+      condition: 'true'
+
+    # ── REPEAT loop: Coordinator_R3R4 -> LoopCounter -> MethodsDesigner_R1 ──
+    - from: Coordinator_R3R4
+      to: LoopCounter
+      trigger: true
+      carry_data: true
+      condition:
+        type: keyword
+        config:
+          any:
+            - REPEAT
+          none: []
+          regex: []
+          case_sensitive: true
+
+    - from: LoopCounter
+      to: MethodsDesigner_R1
+      trigger: true
+      carry_data: true
+      condition: 'true'
+
+    # ── Loop exhausted: LoopCounter -> FinalWriter ───────────────────
+    - from: LoopCounter
+      to: FinalWriter
+      trigger: true
+      carry_data: true
+      condition:
+        type: keyword
+        config:
+          any:
+            - Maximum iteration limit reached
+          none: []
+          regex: []
+          case_sensitive: false
+
+    # ── DONE: Coordinator_R3R4 -> FinalWriter ────────────────────────
+    - from: Coordinator_R3R4
+      to: FinalWriter
+      trigger: true
+      carry_data: true
+      condition:
+        type: keyword
+        config:
+          any:
+            - DONE
+          none:
+            - REPEAT
+          regex: []
+          case_sensitive: true
+
+    # ── FinalWriter -> terminal ──────────────────────────────────────
+    - from: FinalWriter
+      to: FINAL
+      trigger: true
+      carry_data: true
+      condition: 'true'
+
+  initial_instruction: |-
+    Provide input in ONE of the following formats.
+
+    Mode A — Topic-only:
+    Field/domain: {FIELD}
+    Topic seed: {TOPIC}
+    Constraints: {data access, compute, hardware, timeline, tools, target venue}
+
+    Mode B — PDF-seeded (paste text):
+    (1) title/authors/venue/year
+    (2) abstract
+    (3) key method details
+    (4) main results tables/figures as text
+    (5) limitations + future work
+    Optional: reproduction notes and what you can reproduce.
+
+    Also specify if you want internet browsing:
+    ENABLE_BROWSING=true/false
+
+  start:
+    - Coordinator
+  end:
+    - FINAL
+
+vars:
+  OLLAMA_BASE_URL: "${OLLAMA_API_BASE:http://localhost:11434}/v1"
+  API_KEY: "${API_KEY:ollama}"
+  BRAIN_MODEL: "${BRAIN_MODEL:deepseek-r1:70b-llama-distill-q8_0}"
+  EDITOR_MODEL: "${EDITOR_MODEL:llama3.3:70b-instruct-q8_0}"
+  ENABLE_BROWSING: "${ENABLE_BROWSING:false}"
