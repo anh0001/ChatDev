@@ -43,6 +43,10 @@ graph:
           OUTPUT (STRICT):
           1) Seed Summary (Mode, Field, Topic, Constraints, any PDF fields)
           2) Execution Plan: list phases Round1..Round4 with what each agent will output
+
+          IMPORTANT: Your Seed Summary is the anchor for the ENTIRE pipeline. Be thorough and specific.
+          Include ALL key technical details from the input (specific model names, architectures, datasets,
+          metrics, and domain-specific terminology). Downstream agents will rely on this summary to stay on-topic.
         tooling: []
         thinking: null
         memories: []
@@ -50,7 +54,7 @@ graph:
     - id: ProblemScoper
       type: agent
       description: Produces 3-5 precise, falsifiable problem statements from the Seed Summary.
-      context_window: 6
+      context_window: 8
       config:
         name: ${BRAIN_MODEL}
         provider: openai
@@ -63,6 +67,11 @@ graph:
           For each: assumptions, success criteria, and scope boundaries.
           Keep them falsifiable and experimentally grounded.
           Output as bullets with unique IDs (P1..P5).
+
+          GROUNDING RULE: Every problem statement MUST directly relate to the specific methods or
+          limitations described in the Seed Summary. Do NOT drift into generic or tangentially related
+          problems. If the Seed Summary describes a specific system, your problems must be about
+          THAT system or its direct extensions.
         tooling: []
         thinking: null
         memories: []
@@ -70,7 +79,7 @@ graph:
     - id: GapMiner
       type: agent
       description: Extracts unresolved limitations, missing ablations, and untested regimes.
-      context_window: 6
+      context_window: 8
       config:
         name: ${BRAIN_MODEL}
         provider: openai
@@ -85,6 +94,10 @@ graph:
           - questionable assumptions
           - untested regimes
           Map each gap -> hypothesis (G1..Gn), each with a direct falsification test.
+
+          GROUNDING RULE: Every gap and hypothesis MUST be traceable to a specific claim, method,
+          or result in the Seed Summary. Reference the exact component or finding you are targeting.
+          Do NOT introduce gaps from unrelated domains.
         tooling: []
         thinking: null
         memories: []
@@ -92,7 +105,7 @@ graph:
     - id: WebResearcher
       type: agent
       description: Optional prior-art web search agent. Controlled by ENABLE_BROWSING var.
-      context_window: 6
+      context_window: 8
       config:
         name: ${EDITOR_MODEL}
         provider: openai
@@ -110,6 +123,16 @@ graph:
             - Use read_webpage_content to fetch full text of promising results.
             - Return bullet citations (title/venue/year + why relevant).
             - Flag "already-known" risks and suggest novelty pivots.
+
+          CRITICAL — Empty results handling:
+            - If a web_search call returns empty content or no results, explicitly state: "No results found for query: [query]."
+            - Do NOT fabricate, hallucinate, or invent citations. Every citation you output MUST come from an actual search result with a verifiable URL you received.
+            - If all searches return empty, output: "Web search returned no relevant results. Proceeding without prior-art citations."
+            - It is far better to report zero citations than to fabricate even one.
+
+          GROUNDING RULE: Search queries MUST use specific technical terms from the Seed Summary,
+          not generic terms. For example, if the topic is about VLA-based mobile manipulation,
+          search for those exact terms and their components.
         tooling:
           - type: function
             config:
@@ -122,7 +145,7 @@ graph:
     - id: MethodsDesigner_R1
       type: agent
       description: Generates exactly 12 raw research ideas with structured experimental plans.
-      context_window: 10
+      context_window: 12
       config:
         name: ${BRAIN_MODEL}
         provider: openai
@@ -147,6 +170,11 @@ graph:
           Output format:
           Round 1 (Divergent): 12 raw ideas
           I01..I12 with dense structured bullets.
+
+          GROUNDING RULE: Every idea MUST directly extend, challenge, improve, or build upon
+          the specific contributions, methods, or limitations described in the Seed Summary.
+          Begin each idea's problem_statement by referencing which aspect of the Seed Summary
+          it addresses. Discard any idea that could apply to an arbitrary unrelated paper.
         tooling: []
         thinking: null
         memories: []
@@ -154,7 +182,7 @@ graph:
     - id: RedTeamCritic_R2
       type: agent
       description: Attacks all 12 ideas for novelty, feasibility, and confound issues.
-      context_window: 10
+      context_window: 14
       config:
         name: ${BRAIN_MODEL}
         provider: openai
@@ -169,6 +197,11 @@ graph:
           - The single most fatal flaw
           - A stronger variant OR kill-criterion
           Be ruthless.
+
+          RELEVANCE CHECK: The Seed Summary (marked as a kept message in your context) describes
+          the original input topic. Also flag any idea that does NOT directly address this topic.
+          An idea that is generically interesting but irrelevant to the input paper/topic should
+          receive a KILL verdict with reason "off-topic."
         tooling: []
         thinking: null
         memories: []
@@ -176,7 +209,7 @@ graph:
     - id: FeasibilityEngineer_R2
       type: agent
       description: Estimates data/compute/engineering needs and flags impractical ideas.
-      context_window: 10
+      context_window: 14
       config:
         name: ${BRAIN_MODEL}
         provider: openai
@@ -192,6 +225,10 @@ graph:
           - failure modes
           Mark: PRACTICAL / BORDERLINE / IMPRACTICAL
           Provide a cheaper salvage variant for BORDERLINE/IMPRACTICAL.
+
+          GROUNDING RULE: Evaluate feasibility in the context of the specific domain and
+          infrastructure described in the Seed Summary. Consider the actual hardware, simulators,
+          and compute resources relevant to that domain.
         tooling: []
         thinking: null
         memories: []
@@ -199,7 +236,7 @@ graph:
     - id: EvaluationArchitect_R2
       type: agent
       description: Audits all 12 ideas for missing baselines, ablations, and statistical rigor.
-      context_window: 10
+      context_window: 14
       config:
         name: ${BRAIN_MODEL}
         provider: openai
@@ -215,6 +252,10 @@ graph:
           - sanity check
           - falsification criterion
           Propose the minimum fixes required to make it publishable-grade.
+
+          GROUNDING RULE: Baselines and evaluation metrics should be appropriate for the specific
+          domain described in the Seed Summary. Reference standard benchmarks and metrics from
+          that field, not generic ones.
         tooling: []
         thinking: null
         memories: []
@@ -222,7 +263,7 @@ graph:
     - id: Coordinator_R3R4
       type: agent
       description: Converges surviving ideas into Top-5, ranks them, and decides REPEAT or DONE.
-      context_window: 14
+      context_window: 18
       config:
         name: ${EDITOR_MODEL}
         provider: openai
@@ -246,6 +287,10 @@ graph:
           4) Score each with rubric (0-5 each): Novelty, Feasibility, Testability, Impact, Clarity.
           5) Provide one recommended direction + concrete next-action checklist.
 
+          RELEVANCE GATE: Before selecting the Top-5, verify each candidate against the Seed Summary
+          (which appears as a kept message in your context). Discard any idea that is not directly
+          relevant to the original input topic, regardless of how well it scores on other criteria.
+
           End your message with a routing keyword on its own line:
           - If you think another iteration would materially improve results: "REPEAT"
           - Otherwise: "DONE"
@@ -256,7 +301,7 @@ graph:
     - id: FinalWriter
       type: agent
       description: Produces the final polished artifact with ranked ideas and next actions.
-      context_window: 12
+      context_window: 16
       config:
         name: ${EDITOR_MODEL}
         provider: openai
@@ -269,6 +314,10 @@ graph:
           - Ranked Top-5 table
           - Top-5 detailed writeups
           - One recommended direction + next-action checklist
+
+          Every idea in the final output must clearly state how it relates to the original
+          input topic from the Seed Summary. The Seed Summary appears as a kept message in
+          your context — reference it to verify relevance.
         tooling: []
         thinking: null
         memories: []
@@ -278,6 +327,55 @@ graph:
       to: ProblemScoper
       trigger: true
       carry_data: true
+      keep_message: true
+      condition: 'true'
+    - from: Coordinator
+      to: GapMiner
+      trigger: false
+      carry_data: true
+      keep_message: true
+      condition: 'true'
+    - from: Coordinator
+      to: WebResearcher
+      trigger: false
+      carry_data: true
+      keep_message: true
+      condition: 'true'
+    - from: Coordinator
+      to: MethodsDesigner_R1
+      trigger: false
+      carry_data: true
+      keep_message: true
+      condition: 'true'
+    - from: Coordinator
+      to: RedTeamCritic_R2
+      trigger: false
+      carry_data: true
+      keep_message: true
+      condition: 'true'
+    - from: Coordinator
+      to: FeasibilityEngineer_R2
+      trigger: false
+      carry_data: true
+      keep_message: true
+      condition: 'true'
+    - from: Coordinator
+      to: EvaluationArchitect_R2
+      trigger: false
+      carry_data: true
+      keep_message: true
+      condition: 'true'
+    - from: Coordinator
+      to: Coordinator_R3R4
+      trigger: false
+      carry_data: true
+      keep_message: true
+      condition: 'true'
+    - from: Coordinator
+      to: FinalWriter
+      trigger: false
+      carry_data: true
+      keep_message: true
       condition: 'true'
     - from: ProblemScoper
       to: GapMiner
@@ -299,6 +397,25 @@ graph:
       to: RedTeamCritic_R2
       trigger: true
       carry_data: true
+      keep_message: true
+      condition: 'true'
+    - from: MethodsDesigner_R1
+      to: FeasibilityEngineer_R2
+      trigger: false
+      carry_data: true
+      keep_message: true
+      condition: 'true'
+    - from: MethodsDesigner_R1
+      to: EvaluationArchitect_R2
+      trigger: false
+      carry_data: true
+      keep_message: true
+      condition: 'true'
+    - from: MethodsDesigner_R1
+      to: Coordinator_R3R4
+      trigger: false
+      carry_data: true
+      keep_message: true
       condition: 'true'
     - from: RedTeamCritic_R2
       to: FeasibilityEngineer_R2
