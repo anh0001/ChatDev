@@ -175,6 +175,14 @@ graph:
           the specific contributions, methods, or limitations described in the Seed Summary.
           Begin each idea's problem_statement by referencing which aspect of the Seed Summary
           it addresses. Discard any idea that could apply to an arbitrary unrelated paper.
+
+          DIVERSITY RULE: Spread ideas across DIFFERENT categories to avoid clustering:
+          - Performance/optimization (latency, throughput, resource usage)
+          - Architecture/design (new contracts, alternative middleware patterns, modular redesigns)
+          - Generalization (new domains, new hardware, new policy types, sim-to-real transfer)
+          - New applications (multi-robot, human-robot collaboration, novel use cases)
+          - Robustness/safety (adversarial scenarios, failure modes, formal verification)
+          Aim for at least 2 ideas per category. Do NOT generate 12 variations of the same theme.
         tooling: []
         thinking: null
         memories: []
