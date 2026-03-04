@@ -435,8 +435,8 @@ graph:
     - FINAL
 
 vars:
-  OLLAMA_BASE_URL: "${OLLAMA_API_BASE:http://localhost:11434}/v1"
-  API_KEY: "${API_KEY:ollama}"
-  BRAIN_MODEL: "${BRAIN_MODEL:deepseek-r1:70b-llama-distill-q8_0}"
-  EDITOR_MODEL: "${EDITOR_MODEL:llama3.3:70b-instruct-q8_0}"
-  ENABLE_BROWSING: "${ENABLE_BROWSING:false}"
+  OLLAMA_BASE_URL: "http://100.112.100.20:11434/v1"
+  API_KEY: "ollama"
+  BRAIN_MODEL: "qwen3:latest"
+  EDITOR_MODEL: "qwen3:latest"
+  ENABLE_BROWSING: "false"
