@@ -14,8 +14,8 @@ graph:
     Produces a structured final JSON output that can be fed back as input for iterative
     long-horizon refinement. Supports multiple passes: refine problem framing, explore
     new solutions, update plans based on new constraints or feedback.
-    8 agents: Facilitator, Researcher, Ideator, Decision Analyst, Planner, Synthesizer,
-    Critic, Refinement Advisor. Plus a Human feedback node for inter-iteration steering.
+    7 agents: Facilitator, Researcher, Ideator, Decision Analyst, Resource Planner, Synthesizer,
+    Critic, Refinement Advisor. Refinement is done by pasting previous output JSON as new input.
   log_level: INFO
   is_majority_voting: false
 
@@ -45,34 +45,6 @@ graph:
         max_iterations: 5
         reset_on_emit: false
         message: BUDGET_EXHAUSTED — Forcing best-effort finalization with current outputs.
-
-    - id: RefinementLoopCounter
-      type: loop_counter
-      description: Guards the outer refinement loop. Max passes controlled by MAX_REFINEMENT_PASSES.
-      context_window: 0
-      config:
-        max_iterations: 3
-        reset_on_emit: false
-        message: REFINEMENT_LIMIT_REACHED — Maximum refinement passes exhausted. Delivering final output.
-
-    # ──────────────────────────────────────────────────────────
-    # Human feedback node (long-horizon inter-iteration)
-    # ──────────────────────────────────────────────────────────
-
-    - id: HumanFeedback
-      type: human
-      description: |
-        Pauses for user feedback between refinement passes.
-        User can provide new constraints, updated context, request specific
-        steps to be re-run, or approve the output as final.
-      context_window: 0
-      config:
-        description: |
-          The current PTM session output is above. You can:
-          1. Provide refinement feedback (new constraints, updated context, specific concerns)
-          2. Request specific steps to be re-run (e.g., "regenerate solutions", "update plan")
-          3. Type "DONE" or "APPROVE" to accept the current output as final
-          4. Paste a previous session output JSON to continue refining it
 
     # ──────────────────────────────────────────────────────────
     # Agent nodes (8 agents)
@@ -499,6 +471,7 @@ graph:
           - Include measurement at every phase boundary
           - Task dependencies (depends_on[]) MUST form a directed acyclic graph (DAG) — no circular dependencies allowed. Before finalizing, verify no task transitively depends on itself.
           - Budget allocations MUST explicitly account for the full stated budget. If the sum of categories is less than the total, add a 'contingency' or 'unallocated' line item so numbers sum to the stated cap.
+          - DRIVE cross-validation: Before finalizing, verify the execution plan satisfies EVERY success criterion from Step 2. Count days/activities against quantitative DRIVE targets (e.g., if DRIVE requires "3+ relaxation days", the plan must allocate 3+ days). If any criterion cannot be met, flag it explicitly and propose adjustments.
 
           OUTPUT FORMAT:
           ## Step 6: Execution Plan
@@ -572,9 +545,7 @@ graph:
           8. risks_and_mitigations[]: from Resource Planner
           9. assumptions[]: aggregated and deduplicated from all steps
           10. citations[]: from Researcher (empty array if search disabled)
-
-          OPTIONAL BUT RECOMMENDED:
-          11. claim_ledger[]: from Researcher (if search was enabled)
+          11. claim_ledger[]: from Researcher — carry forward ALL claim entries. Never drop claims. Empty array only if Researcher produced none.
           12. decision_log[]: key decisions from each step with when, step, decision, rationale
           13. open_questions[]: unresolved questions with priority, blocking status, target_step
 
@@ -592,10 +563,14 @@ graph:
             * low: thin evidence, many untested assumptions, budget exhaustion occurred, or no citations
           - If Critic flagged issues that were not resolved, note them in open_questions
           - Validate: claim_ledger entries referenced by the selected_solution must be contextually consistent with it (e.g., claims about entity X should not support a solution targeting entity Y). Flag mismatches in open_questions.
+          - Cross-reference: every claim_id in evidence_claim_ids must exist in claim_ledger[]. If a claim is missing from the Researcher output, flag it in open_questions rather than silently dropping it.
 
           OUTPUT:
           Emit ONLY the final JSON object. No commentary before or after.
           The JSON must be valid and parseable.
+          CRITICAL: Do NOT use JavaScript-style comments (// ...) in JSON. JSON does not support comments.
+          Do NOT truncate arrays with "// Additional items omitted" — include ALL items in full.
+          Every array and object must be complete and syntactically valid.
 
           ```json
           {
@@ -764,7 +739,7 @@ graph:
 
     - id: RefinementAdvisor
       type: agent
-      description: Reviews synthesized output, decides whether to offer refinement or finalize.
+      description: Produces final human-readable summary with full JSON for refinement.
       context_window: 12
       config:
         name: ${MODEL_NAME}
@@ -773,16 +748,16 @@ graph:
         api_key: ${API_KEY}
         params:
           temperature: 0.3
-          max_tokens: 3000
+          max_tokens: 20000
         role: |-
           You are the Refinement Advisor — you review the completed PTM session output and
-          decide whether to offer the user a refinement opportunity or finalize the session.
+          produce the final deliverable: a human-readable summary followed by the full JSON.
 
           YOUR TASK:
           1. Review the synthesized JSON output from the current iteration
           2. Assess overall quality, completeness, and confidence level
           3. Identify areas that could benefit from refinement
-          4. Decide routing
+          4. Produce the final output (readable summary + JSON)
 
           ASSESSMENT CRITERIA:
           - Are there blocking open_questions that the user could resolve?
@@ -791,28 +766,12 @@ graph:
           - Are there significant evidence gaps the user might fill?
           - Did any Critic concerns go unresolved?
 
-          ROUTING DECISION:
-          Always present the output to the user. Then decide:
-
-          If the output has clear areas for improvement AND refinement budget remains:
-          - Summarize the output quality and key strengths
-          - List 2-3 specific refinement suggestions the user could act on
-          - End with: "ROUTE: HumanFeedback"
-
-          If the output is high quality OR refinement budget is exhausted:
-          - Summarize the output quality
-          - Note any remaining open questions for the user's awareness
-          - End with: "ROUTE: FINAL"
-
-          IMPORTANT:
-          - Do NOT paste the raw JSON to the user. Users cannot easily read JSON.
-          - Instead, read the Synthesizer JSON from context and produce a clear,
-            human-readable plain-text summary so the user can understand the results
-            and make an informed refinement decision.
-          - Be concise but complete — cover all key aspects of the solution.
-          - Always end with exactly one ROUTE line.
-
           OUTPUT FORMAT:
+          Your output has THREE parts, all in a single response:
+
+          ═══════════════════════════════════════════════════════
+          PART 1: Human-Readable Summary
+          ═══════════════════════════════════════════════════════
 
           ## Results Summary (Iteration [N])
 
@@ -838,12 +797,33 @@ graph:
           ### Open Questions
           (Any unresolved items the user should be aware of. Skip if none.)
 
-          ## Refinement Assessment
+          ## Quality Assessment
           ### Quality: [High / Medium / Low]
           ### Key Strengths: (1-2 bullets)
           ### Refinement Opportunities: (2-3 bullets, if any)
 
-          [ROUTE line]
+          ═══════════════════════════════════════════════════════
+          PART 2: Refinement Instructions
+          ═══════════════════════════════════════════════════════
+
+          ## How to Refine
+          To refine this output, start a new session and paste the JSON below as input,
+          followed by your refinement instructions. Examples:
+          - "Add constraint: no new hires"
+          - "Explore solutions that don't require engineering"
+          - "The selected solution won't work because X — find alternatives"
+
+          ═══════════════════════════════════════════════════════
+          PART 3: Full Session JSON
+          ═══════════════════════════════════════════════════════
+
+          Paste the COMPLETE Synthesizer JSON here inside a ```json code block.
+          Do NOT summarize or truncate it — include every field and array in full.
+          This JSON is the machine-readable output that enables refinement.
+
+          IMPORTANT:
+          - Always end with: "ROUTE: FINAL"
+          - The JSON must be complete and valid — never truncate with comments or ellipsis.
         tooling: []
         thinking: null
         memories:
@@ -926,22 +906,6 @@ graph:
           Deduplicate, normalize IDs, validate cross-references, and set confidence level.
           Include iteration metadata for long-horizon tracking.
           Output ONLY the final valid JSON document.
-        role: user
-
-    - id: PromptRefinementEntry
-      type: literal
-      description: Instruction to Facilitator when entering a refinement pass from user feedback.
-      context_window: 0
-      config:
-        content: |-
-          REFINEMENT PASS: The user has provided feedback on the previous session output.
-          The previous session output JSON and the user's refinement feedback are in your context.
-          Please enter REFINEMENT MODE (Mode B):
-          1. Parse the previous output and the user's feedback
-          2. Identify what changed and what stays the same
-          3. Re-run Steps 1-3 with updated inputs
-          4. Set the appropriate refinement_scope
-          Proceed with your analysis.
         role: user
 
   # ──────────────────────────────────────────────────────────
@@ -1358,101 +1322,12 @@ graph:
     # Phase 6: Refinement loop (long-horizon)
     # ════════════════════════════════════════════════════════
 
-    # RefinementAdvisor decides: finalize or offer refinement
-
-    # If final → FINAL
+    # RefinementAdvisor always routes to FINAL
     - from: RefinementAdvisor
       to: FINAL
-      trigger: true
-      carry_data: true
-      condition:
-        type: keyword
-        config:
-          any:
-            - 'ROUTE: FINAL'
-          none: []
-          regex: []
-          case_sensitive: true
-
-    # If refinement → HumanFeedback (pause for user input)
-    - from: RefinementAdvisor
-      to: HumanFeedback
-      trigger: true
-      carry_data: true
-      condition:
-        type: keyword
-        config:
-          any:
-            - 'ROUTE: HumanFeedback'
-          none: []
-          regex: []
-          case_sensitive: true
-
-    # HumanFeedback → PromptRefinementEntry → Facilitator (re-enter pipeline)
-    - from: HumanFeedback
-      to: PromptRefinementEntry
-      trigger: true
-      carry_data: true
-      condition:
-        type: keyword
-        config:
-          any: []
-          none:
-            - DONE
-            - APPROVE
-          regex: []
-          case_sensitive: false
-
-    # HumanFeedback also increments RefinementLoopCounter (limit guard only)
-    - from: HumanFeedback
-      to: RefinementLoopCounter
-      trigger: true
-      carry_data: true
-      condition:
-        type: keyword
-        config:
-          any: []
-          none:
-            - DONE
-            - APPROVE
-          regex: []
-          case_sensitive: false
-
-    # If user says DONE/APPROVE → go to FINAL
-    - from: HumanFeedback
-      to: FINAL
-      trigger: true
-      carry_data: true
-      condition:
-        type: keyword
-        config:
-          any:
-            - DONE
-            - APPROVE
-          none: []
-          regex: []
-          case_sensitive: false
-
-    # PromptRefinementEntry → Facilitator
-    - from: PromptRefinementEntry
-      to: Facilitator
       trigger: true
       carry_data: true
       condition: 'true'
-
-    # RefinementLoopCounter exhausted → force FINAL
-    - from: RefinementLoopCounter
-      to: FINAL
-      trigger: true
-      carry_data: true
-      condition:
-        type: keyword
-        config:
-          any:
-            - REFINEMENT_LIMIT_REACHED
-          none: []
-          regex: []
-          case_sensitive: false
 
     # ════════════════════════════════════════════════════════
     # Budget exhaustion fallback (inner critic loop)
@@ -1511,7 +1386,8 @@ graph:
     ═══════════════════════════════════════════════════════
     MODE B — REFINEMENT (long-horizon)
     ═══════════════════════════════════════════════════════
-    Paste a previous session output JSON, then add your refinement instructions:
+    To refine a previous session, start a new run and paste the session output JSON
+    (included at the end of every session output) followed by your refinement instructions:
     - "Add constraint: no new hires"
     - "Explore solutions that don't require engineering"
     - "Update timeline to 3 months instead of 6 weeks"
@@ -1519,9 +1395,6 @@ graph:
 
     The system will carry forward what's still valid, update what changed,
     and re-run only the steps that need updating.
-
-    After each pass, you'll be asked if you want to refine further or finalize.
-    Type "DONE" at any feedback prompt to accept the current output.
 
   start:
     - START
