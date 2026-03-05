@@ -1390,7 +1390,7 @@ graph:
     - name: SessionMemory
       type: blackboard
       config:
-        memory_path: auto
+        memory_path: ./data/memory_SessionMemory.json
         max_items: 500
 
   initial_instruction: |-
