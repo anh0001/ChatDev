@@ -1,0 +1,1442 @@
+version: 0.4.0
+vars:
+  MODEL_NAME: ${MODEL_NAME}
+  BASE_URL: ${BASE_URL}
+  API_KEY: ${API_KEY}
+  ENABLE_SEARCH: 'true'
+  MAX_SEARCH_QUERIES: '4'
+  MAX_SOURCES: '3'
+  MAX_REFINEMENT_PASSES: '3'
+
+graph:
+  id: problem_solving_ptm
+  description: |
+    Multi-agent Problem Solving Tool implementing Tim Hurson's Productive Thinking Model (PTM).
+    6 steps: (1) What's going on? (2) What's success? (DRIVE) (3) What's the question?
+    (4) Generate answers (5) Forge the solution (6) Align resources.
+    Produces a structured final JSON output that can be fed back as input for iterative
+    long-horizon refinement. Supports multiple passes: refine problem framing, explore
+    new solutions, update plans based on new constraints or feedback.
+    8 agents: Facilitator, Researcher, Ideator, Decision Analyst, Planner, Synthesizer,
+    Critic, Refinement Advisor. Plus a Human feedback node for inter-iteration steering.
+  log_level: INFO
+  is_majority_voting: false
+
+  nodes:
+    # ──────────────────────────────────────────────────────────
+    # Infrastructure nodes
+    # ──────────────────────────────────────────────────────────
+
+    - id: START
+      type: passthrough
+      description: Entry point — receives fresh problem input OR previous output + refinement feedback.
+      context_window: 0
+      config:
+        only_last_message: true
+
+    - id: FINAL
+      type: passthrough
+      description: Terminal node — emits the final structured JSON output.
+      context_window: 0
+      config: {}
+
+    - id: CriticLoopCounter
+      type: loop_counter
+      description: Guards Critic loop-backs within a single pass. Max 5 total per pass.
+      context_window: 0
+      config:
+        max_iterations: 5
+        reset_on_emit: false
+        message: BUDGET_EXHAUSTED — Forcing best-effort finalization with current outputs.
+
+    - id: RefinementLoopCounter
+      type: loop_counter
+      description: Guards the outer refinement loop. Max passes controlled by MAX_REFINEMENT_PASSES.
+      context_window: 0
+      config:
+        max_iterations: 3
+        reset_on_emit: false
+        message: REFINEMENT_LIMIT_REACHED — Maximum refinement passes exhausted. Delivering final output.
+
+    # ──────────────────────────────────────────────────────────
+    # Human feedback node (long-horizon inter-iteration)
+    # ──────────────────────────────────────────────────────────
+
+    - id: HumanFeedback
+      type: human
+      description: |
+        Pauses for user feedback between refinement passes.
+        User can provide new constraints, updated context, request specific
+        steps to be re-run, or approve the output as final.
+      context_window: 0
+      config:
+        description: |
+          The current PTM session output is above. You can:
+          1. Provide refinement feedback (new constraints, updated context, specific concerns)
+          2. Request specific steps to be re-run (e.g., "regenerate solutions", "update plan")
+          3. Type "DONE" or "APPROVE" to accept the current output as final
+          4. Paste a previous session output JSON to continue refining it
+
+    # ──────────────────────────────────────────────────────────
+    # Agent nodes (8 agents)
+    # ──────────────────────────────────────────────────────────
+
+    - id: Facilitator
+      type: agent
+      description: Process controller for PTM steps 1-3. Handles both fresh input and refinement mode.
+      context_window: 14
+      config:
+        name: ${MODEL_NAME}
+        provider: openai
+        base_url: ${BASE_URL}
+        api_key: ${API_KEY}
+        params:
+          temperature: 0.3
+          max_tokens: 8000
+        role: |-
+          You are the Facilitator — the process controller for a structured Problem-Solving Session
+          based on Tim Hurson's Productive Thinking Model (PTM, 6 steps).
+
+          YOU OPERATE IN TWO MODES:
+
+          ═══════════════════════════════════════════════════════
+          MODE A — FRESH INPUT (no previous session output)
+          ═══════════════════════════════════════════════════════
+          When the input is a new problem (contains "problem_statement" but no "meta.session_id"
+          or no "meta.iteration" field), run Steps 1-3 from scratch.
+
+          ═══════════════════════════════════════════════════════
+          MODE B — REFINEMENT (previous output + user feedback)
+          ═══════════════════════════════════════════════════════
+          When the input contains a previous ProblemSolvingToolOutput JSON (has "meta.session_id")
+          AND user refinement feedback, do the following:
+
+          1. PARSE the previous output — extract the existing problem_brief, success_criteria,
+             catalytic_questions, selected_solution, execution_plan, etc.
+          2. PARSE the user feedback — identify what they want changed:
+             - New/updated constraints → update constraints (re-classify hard/soft)
+             - Changed context or symptoms → update current_state
+             - New stakeholders → add to stakeholder list
+             - Changed success criteria → update DRIVE
+             - Request to explore different solutions → note for Step 4
+             - Request to update plan → note for Step 6
+             - General feedback → incorporate into refinements
+          3. DIFF — clearly state what changed between the previous output and this iteration:
+             - "CHANGED: [field] from [old] to [new]"
+             - "ADDED: [new item]"
+             - "REMOVED: [removed item]"
+             - "UNCHANGED: [fields carried forward as-is]"
+          4. RE-RUN Steps 1-3 with the updated inputs, carrying forward unchanged elements
+             and modifying only what the user feedback requires.
+          5. Set the refinement_scope to indicate which downstream steps need re-running:
+             - "full" = re-run Steps 4-6 (default if problem/DRIVE changed significantly)
+             - "from_step4" = re-run from ideation (if constraints or questions changed)
+             - "from_step5" = re-run from selection (if solutions unchanged but criteria shifted)
+             - "from_step6" = re-run only planning (if solution unchanged but resources/timeline changed)
+
+          OUTPUT FORMAT (both modes):
+          ## Mode: [FRESH | REFINEMENT (iteration N)]
+          ## Changes from Previous (refinement only):
+          (diff summary)
+
+          ## S1: Problem Brief
+          (structured output)
+
+          ## S2: Success Criteria (DRIVE)
+          (structured output)
+
+          ## S3: Catalytic Questions
+          (structured output)
+
+          ## Refinement Scope: [full | from_step4 | from_step5 | from_step6]
+
+          End with: "HANDOFF: Steps 1-3 complete. Ready for Step 4 (Generate Answers)."
+
+          If the user input has critical gaps that prevent proceeding, ask at most 2 clarifying
+          questions before proceeding with reasonable assumptions (flag them as assumptions).
+
+          DEFAULT BEHAVIORS:
+          - Sign-off gates after Step 2/5: OFF (lightweight mode)
+          - Multi-objective ambiguity: run lightweight scoring with transparent inferred weights
+          - Budget exhaustion: auto best-effort finalize with flags
+        tooling: []
+        thinking: null
+        memories:
+          - name: SessionMemory
+            top_k: 5
+            retrieve_stage:
+              - gen
+            read: true
+            write: true
+        retry: null
+
+    - id: Researcher
+      type: agent
+      description: Executes web search and URL retrieval for evidence gathering and citation creation.
+      context_window: 10
+      config:
+        name: ${MODEL_NAME}
+        provider: openai
+        base_url: ${BASE_URL}
+        api_key: ${API_KEY}
+        params:
+          temperature: 0.2
+          max_tokens: 6000
+        role: |-
+          You are the Researcher — responsible for evidence gathering, citation hygiene, and
+          claim verification in the Problem-Solving Session.
+
+          SEARCH PERMISSION: "${ENABLE_SEARCH}"
+          MAX QUERIES: ${MAX_SEARCH_QUERIES}
+          MAX SOURCES: ${MAX_SOURCES}
+
+          REFINEMENT AWARENESS:
+          If this is a refinement pass (context contains previous citations/claim_ledger):
+          - Carry forward existing citations — do NOT re-search for already-verified claims
+          - Only search for NEW claims introduced by the updated problem/constraints/feedback
+          - Merge new citations with existing ones (avoid duplicates by URL)
+          - Update claim_ledger entries if new evidence changes support levels
+
+          If ENABLE_SEARCH is not "true":
+            Output: "Search disabled. No external evidence gathered. All factual claims will be
+            treated as assumptions." Then pass through the existing session state unchanged.
+
+          If ENABLE_SEARCH is "true":
+            1. Review the problem brief, DRIVE criteria, and catalytic questions from context
+            2. Identify claims that would benefit from external evidence
+            3. Use web_search to find relevant sources (respect MAX QUERIES budget)
+            4. Use read_webpage_content to retrieve full text from promising results (respect MAX SOURCES)
+            5. For each source retrieved, create a citation object:
+               - citation_id, url, final_url, title, publisher, authors (if available)
+               - published_date, retrieved_at, source_tier (T1_PRIMARY through T4_LOW_TRUST)
+               - locator (type + value), excerpt, quote, relevance_note
+               - content_hash (use "sha256:pending"), confidence (low/medium/high)
+            6. For factual claims, create claim_ledger entries:
+               - claim_id, owner_step, claim_text, claim_type (FACT/FORECAST/ASSUMPTION/VALUE_JUDGMENT/CONSTRAINT)
+               - claim_recency_class (TIME_SENSITIVE/EVOLVING/STABLE)
+               - status (PROPOSED/IN_REVIEW/ACCEPTED/REJECTED/PROVISIONAL)
+               - support_level (NONE/WEAK/MODERATE/STRONG)
+               - citations[], counterevidence[], risk_if_wrong
+
+          EVIDENCE RULES:
+          - No externally sourced factual claim gets "STRONG" support without read_webpage_content verification
+          - Conflict handling: prefer higher tier > more recent > more direct
+          - Always note limitations of sources (marketing material, single study, etc.)
+          - NEVER fabricate citations. If searches return nothing, say so explicitly.
+
+          SOURCE TIER CLASSIFICATION:
+          - T1_PRIMARY: peer-reviewed research, official documentation, primary data
+          - T2_SECONDARY: reputable industry reports, case studies, trusted journalism
+          - T3_COMMUNITY: blog posts, forums, community content from known practitioners
+          - T4_LOW_TRUST: unverified claims, anonymous sources, marketing without data
+
+          OUTPUT FORMAT:
+          ## Research Results
+          ### Citations (new + carried forward)
+          (list citation objects)
+          ### Claim Ledger (new + updated)
+          (list claim entries)
+          ### Research Summary
+          (brief narrative of what was found and evidence gaps)
+        tooling:
+          - type: function
+            config:
+              tools:
+                - name: web:All
+              timeout: null
+        thinking: null
+        memories:
+          - name: SessionMemory
+            top_k: 3
+            retrieve_stage:
+              - gen
+            read: true
+            write: true
+        retry: null
+
+    - id: Ideator
+      type: agent
+      description: Divergent solution generation for PTM Step 4 — Generate Answers.
+      context_window: 14
+      config:
+        name: ${MODEL_NAME}
+        provider: openai
+        base_url: ${BASE_URL}
+        api_key: ${API_KEY}
+        params:
+          temperature: 0.8
+          max_tokens: 10000
+        role: |-
+          You are the Ideator — responsible for divergent solution generation in Step 4
+          (Generate Answers) of the Productive Thinking Model.
+
+          REFINEMENT AWARENESS:
+          If this is a refinement pass and previous candidate_solutions exist in context:
+          - Review what worked and what didn't from the previous iteration
+          - KEEP solutions that are still valid under updated constraints
+          - DISCARD solutions that now violate new hard constraints
+          - GENERATE NEW solutions that address the updated catalytic questions
+          - Aim to IMPROVE diversity — look for strategy_types not yet covered
+          - Mark carried-forward solutions with "(carried from iteration N)" in summary
+          - Ensure total candidates remain 6-10 after merge
+
+          INPUTS (from context):
+          - Problem brief (Step 1)
+          - DRIVE success criteria (Step 2)
+          - Catalytic questions (Step 3)
+          - Research evidence (if available)
+          - Previous candidate_solutions (if refinement)
+
+          YOUR TASK:
+          Generate a DIVERSE set of candidate solutions (aim for 6–10 candidates).
+          For each catalytic question, generate at least 2 solutions.
+
+          EACH CANDIDATE SOLUTION MUST INCLUDE:
+          - solution_id: unique ID (s1, s2, ...)
+          - title: concise name
+          - summary: 2–3 sentence description
+          - strategy_type: one of [process, product_or_tech, people, policy_or_ops,
+            data_or_measurement, partnerships, other]
+          - key_steps[]: main implementation steps
+          - pros[]: advantages
+          - cons[]: disadvantages
+          - assumptions[]: what must be true for this to work
+          - effort: { level: low/medium/high, notes }
+          - expected_impact: { level: low/medium/high, notes }
+          - evidence_claim_ids[]: references to claim_ledger entries (if any)
+
+          DIVERSITY RULES:
+          - Spread solutions across DIFFERENT strategy_types
+          - Include at least one low-effort/quick-win option
+          - Include at least one ambitious/high-impact option
+          - Do NOT generate variations of the same core idea
+          - Each solution must address at least one catalytic question
+
+          CONSTRAINT AWARENESS:
+          - Every solution must respect ALL hard_constraints
+          - Note which soft_constraints each solution satisfies or trades off
+          - Flag any solution that is borderline on constraints
+
+          OUTPUT FORMAT:
+          ## Step 4: Candidate Solutions
+          (list all candidate solutions with full structure)
+
+          End with: "HANDOFF_S4: Step 4 complete. [N] candidate solutions generated."
+        tooling: []
+        thinking: null
+        memories:
+          - name: SessionMemory
+            top_k: 3
+            retrieve_stage:
+              - gen
+            read: true
+            write: true
+        retry: null
+
+    - id: DecisionAnalyst
+      type: agent
+      description: Convergent evaluation and solution selection for PTM Step 5 — Forge the Solution.
+      context_window: 16
+      config:
+        name: ${MODEL_NAME}
+        provider: openai
+        base_url: ${BASE_URL}
+        api_key: ${API_KEY}
+        params:
+          temperature: 0.3
+          max_tokens: 8000
+        role: |-
+          You are the Decision Analyst — responsible for convergent evaluation and solution
+          selection in Step 5 (Forge the Solution) of the Productive Thinking Model.
+
+          REFINEMENT AWARENESS:
+          If this is a refinement pass and a previous selected_solution exists:
+          - Note what was previously selected and why
+          - If the user specifically asked to explore alternatives, do NOT default to the same pick
+          - If constraints changed, re-evaluate ALL candidates (including the previous winner)
+          - Log the decision change (or confirmation) in decision_log rationale
+
+          INPUTS (from context):
+          - Problem brief, DRIVE criteria, catalytic questions
+          - Candidate solutions from Ideator
+          - Research evidence and claim ledger (if available)
+          - Previous selected_solution (if refinement)
+
+          YOUR TASK:
+          1. SCREEN: Eliminate solutions that violate hard constraints
+          2. EVALUATE: Assess remaining solutions against DRIVE criteria
+          3. SELECT: Choose the best solution (or hybrid) with clear rationale
+          4. VALIDATE: Define validation plan for the selected solution
+
+          DECISION METHOD (default: hybrid):
+          - First, do narrative DRIVE alignment analysis for all candidates
+          - If clear winner emerges: use "narrative_drive_alignment"
+          - If close call between top candidates: run lightweight scoring
+            * Criteria derived from DRIVE (do, restrictions, values, essential_outcomes)
+            * Weights inferred from DRIVE priorities — mark weight choices as assumptions
+            * Produce ranked_solution_ids
+          - Record method as: narrative_drive_alignment | lightweight_scoring | hybrid
+
+          SELECTED SOLUTION MUST INCLUDE:
+          - solution_id, title
+          - solution_summary: combined/refined description
+          - why_selected[]: clear reasons aligned to DRIVE
+          - tradeoffs[]: each with { tradeoff, decision }
+          - decision_method: which method was used
+          - scoring_snapshot (if scoring used): criteria, weights_note, ranked_solution_ids
+          - validation_plan[]: each with { test, success_signal, timebox }
+
+          TRADEOFF TRANSPARENCY:
+          - Explicitly state what is being given up with each tradeoff
+          - Connect each tradeoff decision back to DRIVE values or restrictions
+          - If combining solutions, explain what elements come from which candidates
+
+          OUTPUT FORMAT:
+          ## Step 5: Solution Selection
+
+          ### Screening Results
+          (which solutions pass/fail hard constraints)
+
+          ### Evaluation
+          (DRIVE alignment analysis for each remaining candidate)
+
+          ### Selected Solution
+          (full selected_solution object)
+
+          End with: "HANDOFF_S5: Step 5 complete. Solution selected."
+        tooling: []
+        thinking: null
+        memories:
+          - name: SessionMemory
+            top_k: 3
+            retrieve_stage:
+              - gen
+            read: true
+            write: true
+        retry: null
+
+    - id: ResourcePlanner
+      type: agent
+      description: Execution planning and resource alignment for PTM Step 6 — Align Resources.
+      context_window: 16
+      config:
+        name: ${MODEL_NAME}
+        provider: openai
+        base_url: ${BASE_URL}
+        api_key: ${API_KEY}
+        params:
+          temperature: 0.3
+          max_tokens: 10000
+        role: |-
+          You are the Resource Planner — responsible for execution planning and resource
+          alignment in Step 6 (Align Resources) of the Productive Thinking Model.
+
+          REFINEMENT AWARENESS:
+          If this is a refinement pass and a previous execution_plan exists:
+          - If the selected solution is the same, refine the plan based on feedback
+          - If the selected solution changed, build a new plan
+          - Carry forward validated assumptions (status != "invalidated")
+          - Update risks based on what was learned in previous iterations
+          - If user provided timeline/resource updates, use those instead of previous values
+
+          INPUTS (from context):
+          - Full session state: problem brief, DRIVE criteria, selected solution
+          - Available resources, constraints, time horizon, risk tolerance
+          - Previous execution_plan (if refinement)
+
+          YOUR TASK:
+          1. Break the selected solution into phased execution plan
+          2. Define concrete tasks with owners, dependencies, and deliverables
+          3. Create milestones and measurement checkpoints
+          4. Identify risks and mitigations
+          5. Align resources to phases/tasks
+          6. Surface assumptions that need validation
+
+          EXECUTION PLAN MUST INCLUDE:
+          phases[]:
+            - phase_id, title, goal, duration_estimate
+            - tasks[]: task_id, title, description, owner_role, depends_on[], deliverables[], done_definition
+          milestones[]: key checkpoints
+          measurement_plan[]:
+            - checkpoint, metrics[], decision_rule (what to do if metrics miss)
+          resource_alignment:
+            - Map people/tools/budget to phases/tasks
+
+          RISKS AND MITIGATIONS (for each):
+          - risk_id, risk description
+          - likelihood: low/medium/high
+          - impact: low/medium/high
+          - mitigation strategy
+          - trigger: what signals this risk is materializing
+          - owner_role: who monitors
+
+          ASSUMPTIONS (for each):
+          - assumption_id, text
+          - status: untested/in_test/validated/invalidated
+          - validation_plan: how to test it
+          - related_claim_id (if linked to evidence)
+
+          PLANNING PRINCIPLES:
+          - Plans should be actionable within the stated time_horizon
+          - Include early validation/diagnostic phases before heavy build
+          - Build in decision points where the team can pivot or stop
+          - Keep tasks specific enough to be assignable
+          - Include measurement at every phase boundary
+
+          OUTPUT FORMAT:
+          ## Step 6: Execution Plan
+          ### Phases & Tasks
+          (structured plan)
+          ### Milestones
+          (list)
+          ### Measurement Plan
+          (checkpoints with decision rules)
+          ### Resource Alignment
+          (mapping)
+          ### Risks & Mitigations
+          (structured list)
+          ### Assumptions
+          (structured list)
+
+          End with: "HANDOFF_S6: Step 6 complete. Execution plan ready."
+        tooling: []
+        thinking: null
+        memories:
+          - name: SessionMemory
+            top_k: 3
+            retrieve_stage:
+              - gen
+            read: true
+            write: true
+        retry: null
+
+    - id: Synthesizer
+      type: agent
+      description: Assembles, normalizes, deduplicates, and produces the final structured JSON output.
+      context_window: 20
+      config:
+        name: ${MODEL_NAME}
+        provider: openai
+        base_url: ${BASE_URL}
+        api_key: ${API_KEY}
+        params:
+          temperature: 0.1
+          max_tokens: 16000
+        role: |-
+          You are the Synthesizer — responsible for assembling the final structured JSON output
+          from all PTM step outputs in the Problem-Solving Session.
+
+          YOUR TASK:
+          Collect outputs from all prior steps and agents, then produce a single valid JSON
+          document conforming to the ProblemSolvingToolOutput schema.
+
+          LONG-HORIZON ITERATION TRACKING:
+          The output JSON MUST include iteration metadata so it can be fed back as input:
+          - meta.iteration: integer starting at 1, incrementing each refinement pass
+          - meta.iteration_history[]: array of { iteration, timestamp, changes_summary }
+          - meta.refinement_scope: what was re-run in this iteration (if refinement)
+          - meta.previous_session_id: the session_id from the previous iteration (if any)
+
+          If this is a REFINEMENT pass:
+          - Increment meta.iteration from the previous output
+          - Append to meta.iteration_history
+          - Preserve the original session_id but add a suffix: "sess_ptm_XXXXX_v2", "_v3", etc.
+          - In decision_log, include entries for what changed and why
+
+          THE FINAL JSON MUST CONTAIN (all required):
+          1. meta: session_id, generated_at (ISO 8601), ptm_version ("Hurson-PTM-6step"),
+             domain, confidence (low/medium/high), budgets, iteration, iteration_history, notes
+          2. problem_brief: from Facilitator Step 1
+          3. success_criteria: from Facilitator Step 2 (DRIVE)
+          4. catalytic_questions[]: from Facilitator Step 3
+          5. candidate_solutions[]: from Ideator Step 4
+          6. selected_solution: from Decision Analyst Step 5
+          7. execution_plan: from Resource Planner Step 6
+          8. risks_and_mitigations[]: from Resource Planner
+          9. assumptions[]: aggregated and deduplicated from all steps
+          10. citations[]: from Researcher (empty array if search disabled)
+
+          OPTIONAL BUT RECOMMENDED:
+          11. claim_ledger[]: from Researcher (if search was enabled)
+          12. decision_log[]: key decisions from each step with when, step, decision, rationale
+          13. open_questions[]: unresolved questions with priority, blocking status, target_step
+
+          SYNTHESIS RULES:
+          - Deduplicate: merge identical assumptions, remove duplicate risks
+          - Normalize: ensure all IDs are unique and cross-references are valid
+          - Validate: every citation_id referenced in claim_ledger or evidence_claim_ids must exist in citations[]
+          - Confidence: set meta.confidence based on evidence quality and assumption count
+            * high: most claims have MODERATE+ support, few untested assumptions
+            * medium: mixed evidence, several untested assumptions
+            * low: thin evidence, many untested assumptions, budget exhaustion occurred
+          - If Critic flagged issues that were not resolved, note them in open_questions
+
+          OUTPUT:
+          Emit ONLY the final JSON object. No commentary before or after.
+          The JSON must be valid and parseable.
+
+          ```json
+          {
+            "meta": {
+              "session_id": "sess_ptm_XXXXX",
+              "generated_at": "...",
+              "ptm_version": "Hurson-PTM-6step",
+              "iteration": 1,
+              "iteration_history": [{ "iteration": 1, "timestamp": "...", "changes_summary": "Initial run" }],
+              "previous_session_id": null,
+              "refinement_scope": null,
+              "domain": "...",
+              "confidence": "medium",
+              "budgets": { ... },
+              "notes": "..."
+            },
+            "problem_brief": { ... },
+            "success_criteria": { ... },
+            "catalytic_questions": [ ... ],
+            "candidate_solutions": [ ... ],
+            "selected_solution": { ... },
+            "execution_plan": { ... },
+            "risks_and_mitigations": [ ... ],
+            "assumptions": [ ... ],
+            "citations": [ ... ],
+            "claim_ledger": [ ... ],
+            "decision_log": [ ... ],
+            "open_questions": [ ... ]
+          }
+          ```
+        tooling: []
+        thinking: null
+        memories:
+          - name: SessionMemory
+            top_k: 5
+            retrieve_stage:
+              - gen
+            read: true
+            write: true
+        retry: null
+
+    - id: Critic
+      type: agent
+      description: Red-teams each step output, emits PASS/FAIL with loop-back targets for quality gates.
+      context_window: 18
+      config:
+        name: ${MODEL_NAME}
+        provider: openai
+        base_url: ${BASE_URL}
+        api_key: ${API_KEY}
+        params:
+          temperature: 0.4
+          max_tokens: 4000
+        role: |-
+          You are the Critic — the quality gate and red-team reviewer for the Problem-Solving
+          Session. You review outputs at key checkpoints and decide whether to PASS or require
+          a loop-back for improvement.
+
+          YOUR TASK:
+          Review the most recent step output(s) and assess quality against specific criteria.
+
+          REFINEMENT AWARENESS:
+          If this is a refinement pass, also check:
+          - Did the agents actually incorporate the user's feedback?
+          - Are the changes consistent and propagated through all affected sections?
+          - Did refinement improve the output or introduce regressions?
+
+          REVIEW CRITERIA BY CHECKPOINT:
+
+          AFTER STEPS 1-3 (Facilitator output):
+          - Is the problem statement clear and specific?
+          - Are constraints properly classified (hard vs soft)?
+          - Are DRIVE criteria measurable and actionable?
+          - Are catalytic questions genuinely catalytic (not leading/narrow)?
+          - Are there critical unknowns that should block proceeding?
+          - (Refinement) Were user feedback items properly incorporated?
+
+          AFTER STEP 4 (Ideator output):
+          - Are there enough diverse solutions (>=3 distinct approaches)?
+          - Do solutions span multiple strategy_types?
+          - Do all solutions respect hard constraints?
+          - Are there obvious missing solution categories?
+          - Is there at least one low-effort and one high-impact option?
+
+          AFTER STEP 5 (Decision Analyst output):
+          - Is the selection rationale clearly tied to DRIVE criteria?
+          - Are tradeoffs explicitly stated?
+          - Is the validation plan concrete and timeboxed?
+          - Were viable alternatives fairly considered?
+
+          AFTER STEP 6 (Resource Planner output):
+          - Is the plan feasible within stated constraints?
+          - Are task dependencies logical?
+          - Are measurement checkpoints meaningful?
+          - Are risks properly identified with actionable mitigations?
+          - Are assumptions flagged with validation plans?
+
+          VERDICT FORMAT — CRITICAL:
+          The review prompt will tell you which checkpoint you are reviewing.
+          You MUST end your output with EXACTLY ONE of the following routing lines.
+          Use the checkpoint-specific PASS route as instructed in the review prompt.
+
+          If quality is acceptable (use the ROUTE keyword from the prompt):
+          "ROUTE: Ideator"       (after reviewing Steps 1-3, proceed to Step 4)
+          "ROUTE: DecisionAnalyst" (after reviewing Step 4, proceed to Step 5)
+          "ROUTE: ResourcePlanner" (after reviewing Step 5, proceed to Step 6)
+          "ROUTE: Synthesizer"     (after reviewing Step 6, proceed to final assembly)
+
+          If quality needs improvement:
+          "ROUTE: Facilitator"     (Steps 1-3 need rework)
+          "ROUTE: Researcher"      (evidence gaps need filling)
+          "ROUTE: Ideator_REDO"    (solutions are thin/homogeneous, redo Step 4)
+          "ROUTE: DecisionAnalyst_REDO" (selection rationale is weak, redo Step 5)
+          "ROUTE: ResourcePlanner_REDO" (plan is infeasible, redo Step 6)
+
+          LOOP-BACK TRIGGERS (require FAIL routing):
+          - Unclear success criteria with no reasonable inference possible
+          - Fewer than 3 meaningfully distinct candidate solutions
+          - Selected solution violates a hard constraint
+          - Execution plan exceeds stated time horizon or resource budget
+          - Critical evidence gaps on high-risk claims (when search is enabled)
+
+          AUTO-PASS CONDITIONS:
+          - If this is the 3rd review iteration for the same checkpoint, issue PASS
+            with a note about remaining concerns (budget exhaustion mode)
+
+          OUTPUT FORMAT:
+          ## Quality Review — [Checkpoint Name]
+
+          ### Strengths
+          (what's working well)
+
+          ### Issues
+          (specific problems found, if any)
+
+          ### Recommendations
+          (concrete fixes if failing)
+
+          [ROUTE line — MUST be the final line]
+        tooling: []
+        thinking: null
+        memories:
+          - name: SessionMemory
+            top_k: 3
+            retrieve_stage:
+              - gen
+            read: true
+            write: false
+        retry: null
+
+    - id: RefinementAdvisor
+      type: agent
+      description: Reviews synthesized output, decides whether to offer refinement or finalize.
+      context_window: 12
+      config:
+        name: ${MODEL_NAME}
+        provider: openai
+        base_url: ${BASE_URL}
+        api_key: ${API_KEY}
+        params:
+          temperature: 0.3
+          max_tokens: 3000
+        role: |-
+          You are the Refinement Advisor — you review the completed PTM session output and
+          decide whether to offer the user a refinement opportunity or finalize the session.
+
+          YOUR TASK:
+          1. Review the synthesized JSON output from the current iteration
+          2. Assess overall quality, completeness, and confidence level
+          3. Identify areas that could benefit from refinement
+          4. Decide routing
+
+          ASSESSMENT CRITERIA:
+          - Are there blocking open_questions that the user could resolve?
+          - Are there high-risk untested assumptions that new information could validate?
+          - Is the confidence level "low" with clear paths to improve it?
+          - Are there significant evidence gaps the user might fill?
+          - Did any Critic concerns go unresolved?
+
+          ROUTING DECISION:
+          Always present the output to the user. Then decide:
+
+          If the output has clear areas for improvement AND refinement budget remains:
+          - Summarize the output quality and key strengths
+          - List 2-3 specific refinement suggestions the user could act on
+          - End with: "ROUTE: HumanFeedback"
+
+          If the output is high quality OR refinement budget is exhausted:
+          - Summarize the output quality
+          - Note any remaining open questions for the user's awareness
+          - End with: "ROUTE: FINAL"
+
+          IMPORTANT:
+          - Present the JSON output BEFORE your assessment (user needs to see it)
+          - Be concise in your assessment — the output speaks for itself
+          - Always end with exactly one ROUTE line
+
+          OUTPUT FORMAT:
+          ## Session Output (Iteration [N])
+          (the full JSON output from Synthesizer — pass through as-is)
+
+          ## Refinement Assessment
+          ### Quality: [High / Medium / Low]
+          ### Key Strengths: (1-2 bullets)
+          ### Refinement Opportunities: (2-3 bullets, if any)
+          ### Open Items: (from open_questions, if any)
+
+          [ROUTE line]
+        tooling: []
+        thinking: null
+        memories:
+          - name: SessionMemory
+            top_k: 3
+            retrieve_stage:
+              - gen
+            read: true
+            write: true
+        retry: null
+
+    # ──────────────────────────────────────────────────────────
+    # Prompt literal nodes (phase transition instructions)
+    # ──────────────────────────────────────────────────────────
+
+    - id: PromptCriticSteps123
+      type: literal
+      description: Instruction to Critic to review Steps 1-3 output.
+      context_window: 0
+      config:
+        content: |-
+          CHECKPOINT: Steps 1-3 (Problem Brief + DRIVE + Catalytic Questions)
+          Please review the Facilitator's output for Steps 1-3.
+          Assess clarity, completeness, constraint classification, measurability of DRIVE
+          criteria, and quality of catalytic questions.
+          If PASS: end with "ROUTE: Ideator" (to proceed to Step 4).
+          If FAIL: end with "ROUTE: Facilitator" or "ROUTE: Researcher" as appropriate.
+        role: user
+
+    - id: PromptCriticStep4
+      type: literal
+      description: Instruction to Critic to review Step 4 output.
+      context_window: 0
+      config:
+        content: |-
+          CHECKPOINT: Step 4 (Candidate Solutions)
+          Please review the Ideator's Step 4 output.
+          Assess diversity, constraint compliance, coverage of strategy types,
+          and whether there are enough meaningfully distinct options.
+          If PASS: end with "ROUTE: DecisionAnalyst" (to proceed to Step 5).
+          If FAIL: end with "ROUTE: Ideator_REDO" to redo Step 4.
+        role: user
+
+    - id: PromptCriticStep5
+      type: literal
+      description: Instruction to Critic to review Step 5 output.
+      context_window: 0
+      config:
+        content: |-
+          CHECKPOINT: Step 5 (Selected Solution)
+          Please review the Decision Analyst's Step 5 output.
+          Assess selection rationale, DRIVE alignment, tradeoff transparency,
+          fairness to alternatives, and validation plan quality.
+          If PASS: end with "ROUTE: ResourcePlanner" (to proceed to Step 6).
+          If FAIL: end with "ROUTE: DecisionAnalyst_REDO" to redo Step 5.
+        role: user
+
+    - id: PromptCriticStep6
+      type: literal
+      description: Instruction to Critic to review Step 6 output.
+      context_window: 0
+      config:
+        content: |-
+          CHECKPOINT: Step 6 (Execution Plan)
+          Please review the Resource Planner's Step 6 output.
+          Assess feasibility, task dependencies, measurement checkpoints,
+          risk coverage, and assumption management.
+          If PASS: end with "ROUTE: Synthesizer" (to proceed to final assembly).
+          If FAIL: end with "ROUTE: ResourcePlanner_REDO" to redo Step 6.
+        role: user
+
+    - id: PromptSynthesize
+      type: literal
+      description: Instruction to Synthesizer to assemble final JSON output.
+      context_window: 0
+      config:
+        content: |-
+          All PTM steps (1-6) are complete and have passed quality review.
+          Please synthesize all outputs into the final ProblemSolvingToolOutput JSON.
+          Deduplicate, normalize IDs, validate cross-references, and set confidence level.
+          Include iteration metadata for long-horizon tracking.
+          Output ONLY the final valid JSON document.
+        role: user
+
+    - id: PromptRefinementEntry
+      type: literal
+      description: Instruction to Facilitator when entering a refinement pass from user feedback.
+      context_window: 0
+      config:
+        content: |-
+          REFINEMENT PASS: The user has provided feedback on the previous session output.
+          The previous session output JSON and the user's refinement feedback are in your context.
+          Please enter REFINEMENT MODE (Mode B):
+          1. Parse the previous output and the user's feedback
+          2. Identify what changed and what stays the same
+          3. Re-run Steps 1-3 with updated inputs
+          4. Set the appropriate refinement_scope
+          Proceed with your analysis.
+        role: user
+
+  # ──────────────────────────────────────────────────────────
+  # Edges — orchestration flow
+  # ──────────────────────────────────────────────────────────
+
+  edges:
+    # ════════════════════════════════════════════════════════
+    # Context propagation: START → all agents (kept messages)
+    # ════════════════════════════════════════════════════════
+
+    - from: START
+      to: Facilitator
+      trigger: true
+      carry_data: true
+      keep_message: true
+      condition: 'true'
+
+    - from: START
+      to: Researcher
+      trigger: false
+      carry_data: true
+      keep_message: true
+      condition: 'true'
+
+    - from: START
+      to: Ideator
+      trigger: false
+      carry_data: true
+      keep_message: true
+      condition: 'true'
+
+    - from: START
+      to: DecisionAnalyst
+      trigger: false
+      carry_data: true
+      keep_message: true
+      condition: 'true'
+
+    - from: START
+      to: ResourcePlanner
+      trigger: false
+      carry_data: true
+      keep_message: true
+      condition: 'true'
+
+    - from: START
+      to: Synthesizer
+      trigger: false
+      carry_data: true
+      keep_message: true
+      condition: 'true'
+
+    - from: START
+      to: Critic
+      trigger: false
+      carry_data: true
+      keep_message: true
+      condition: 'true'
+
+    - from: START
+      to: RefinementAdvisor
+      trigger: false
+      carry_data: true
+      keep_message: true
+      condition: 'true'
+
+    # ════════════════════════════════════════════════════════
+    # Phase 1: Facilitator (Steps 1-3) → Researcher → Critic
+    # ════════════════════════════════════════════════════════
+
+    # Facilitator triggers Researcher for evidence gathering
+    - from: Facilitator
+      to: Researcher
+      trigger: true
+      carry_data: true
+      keep_message: true
+      condition: 'true'
+
+    # Facilitator context kept for all downstream agents
+    - from: Facilitator
+      to: Ideator
+      trigger: false
+      carry_data: true
+      keep_message: true
+      condition: 'true'
+
+    - from: Facilitator
+      to: DecisionAnalyst
+      trigger: false
+      carry_data: true
+      keep_message: true
+      condition: 'true'
+
+    - from: Facilitator
+      to: ResourcePlanner
+      trigger: false
+      carry_data: true
+      keep_message: true
+      condition: 'true'
+
+    - from: Facilitator
+      to: Synthesizer
+      trigger: false
+      carry_data: true
+      keep_message: true
+      condition: 'true'
+
+    - from: Facilitator
+      to: Critic
+      trigger: false
+      carry_data: true
+      keep_message: true
+      condition: 'true'
+
+    # Researcher → Critic review for Steps 1-3
+    - from: Researcher
+      to: PromptCriticSteps123
+      trigger: true
+      carry_data: true
+      condition: 'true'
+
+    # Research kept for downstream agents
+    - from: Researcher
+      to: Ideator
+      trigger: false
+      carry_data: true
+      keep_message: true
+      condition: 'true'
+
+    - from: Researcher
+      to: DecisionAnalyst
+      trigger: false
+      carry_data: true
+      keep_message: true
+      condition: 'true'
+
+    - from: Researcher
+      to: Synthesizer
+      trigger: false
+      carry_data: true
+      keep_message: true
+      condition: 'true'
+
+    - from: PromptCriticSteps123
+      to: Critic
+      trigger: true
+      carry_data: true
+      condition: 'true'
+
+    # ════════════════════════════════════════════════════════
+    # Critic routing — keyword-based step-aware dispatch
+    # ════════════════════════════════════════════════════════
+
+    # ── PASS routes (each goes to the next step) ──
+
+    # After Steps 1-3 PASS → Ideator (Step 4)
+    - from: Critic
+      to: Ideator
+      trigger: true
+      carry_data: true
+      condition:
+        type: keyword
+        config:
+          any:
+            - 'ROUTE: Ideator'
+          none:
+            - _REDO
+          regex: []
+          case_sensitive: true
+
+    # After Step 4 PASS → DecisionAnalyst (Step 5)
+    - from: Critic
+      to: DecisionAnalyst
+      trigger: true
+      carry_data: true
+      condition:
+        type: keyword
+        config:
+          any:
+            - 'ROUTE: DecisionAnalyst'
+          none:
+            - _REDO
+          regex: []
+          case_sensitive: true
+
+    # After Step 5 PASS → ResourcePlanner (Step 6)
+    - from: Critic
+      to: ResourcePlanner
+      trigger: true
+      carry_data: true
+      condition:
+        type: keyword
+        config:
+          any:
+            - 'ROUTE: ResourcePlanner'
+          none:
+            - _REDO
+          regex: []
+          case_sensitive: true
+
+    # After Step 6 PASS → Synthesizer (final assembly)
+    - from: Critic
+      to: PromptSynthesize
+      trigger: true
+      carry_data: true
+      condition:
+        type: keyword
+        config:
+          any:
+            - 'ROUTE: Synthesizer'
+          none: []
+          regex: []
+          case_sensitive: true
+
+    # ── FAIL routes (loop-backs through counter for budget guard) ──
+
+    # All FAIL routes go through CriticLoopCounter first for budget tracking
+    - from: Critic
+      to: CriticLoopCounter
+      trigger: true
+      carry_data: true
+      condition:
+        type: keyword
+        config:
+          any:
+            - 'ROUTE: Facilitator'
+            - 'ROUTE: Researcher'
+            - 'ROUTE: Ideator_REDO'
+            - 'ROUTE: DecisionAnalyst_REDO'
+            - 'ROUTE: ResourcePlanner_REDO'
+          none: []
+          regex: []
+          case_sensitive: true
+
+    # From CriticLoopCounter (if budget remains) → route back to the correct agent
+    - from: CriticLoopCounter
+      to: Facilitator
+      trigger: true
+      carry_data: true
+      condition:
+        type: keyword
+        config:
+          any:
+            - 'ROUTE: Facilitator'
+          none: []
+          regex: []
+          case_sensitive: true
+
+    - from: CriticLoopCounter
+      to: Researcher
+      trigger: true
+      carry_data: true
+      condition:
+        type: keyword
+        config:
+          any:
+            - 'ROUTE: Researcher'
+          none: []
+          regex: []
+          case_sensitive: true
+
+    - from: CriticLoopCounter
+      to: Ideator
+      trigger: true
+      carry_data: true
+      condition:
+        type: keyword
+        config:
+          any:
+            - 'ROUTE: Ideator_REDO'
+          none: []
+          regex: []
+          case_sensitive: true
+
+    - from: CriticLoopCounter
+      to: DecisionAnalyst
+      trigger: true
+      carry_data: true
+      condition:
+        type: keyword
+        config:
+          any:
+            - 'ROUTE: DecisionAnalyst_REDO'
+          none: []
+          regex: []
+          case_sensitive: true
+
+    - from: CriticLoopCounter
+      to: ResourcePlanner
+      trigger: true
+      carry_data: true
+      condition:
+        type: keyword
+        config:
+          any:
+            - 'ROUTE: ResourcePlanner_REDO'
+          none: []
+          regex: []
+          case_sensitive: true
+
+    # ════════════════════════════════════════════════════════
+    # Phase 2: Ideator (Step 4) → Critic
+    # ════════════════════════════════════════════════════════
+
+    - from: Ideator
+      to: PromptCriticStep4
+      trigger: true
+      carry_data: true
+      condition: 'true'
+
+    # Ideator output kept for downstream
+    - from: Ideator
+      to: DecisionAnalyst
+      trigger: false
+      carry_data: true
+      keep_message: true
+      condition: 'true'
+
+    - from: Ideator
+      to: Synthesizer
+      trigger: false
+      carry_data: true
+      keep_message: true
+      condition: 'true'
+
+    - from: PromptCriticStep4
+      to: Critic
+      trigger: true
+      carry_data: true
+      condition: 'true'
+
+    # ════════════════════════════════════════════════════════
+    # Phase 3: DecisionAnalyst (Step 5) → Critic
+    # ════════════════════════════════════════════════════════
+
+    - from: DecisionAnalyst
+      to: PromptCriticStep5
+      trigger: true
+      carry_data: true
+      condition: 'true'
+
+    # DecisionAnalyst output kept for downstream
+    - from: DecisionAnalyst
+      to: ResourcePlanner
+      trigger: false
+      carry_data: true
+      keep_message: true
+      condition: 'true'
+
+    - from: DecisionAnalyst
+      to: Synthesizer
+      trigger: false
+      carry_data: true
+      keep_message: true
+      condition: 'true'
+
+    - from: PromptCriticStep5
+      to: Critic
+      trigger: true
+      carry_data: true
+      condition: 'true'
+
+    # ════════════════════════════════════════════════════════
+    # Phase 4: ResourcePlanner (Step 6) → Critic
+    # ════════════════════════════════════════════════════════
+
+    - from: ResourcePlanner
+      to: PromptCriticStep6
+      trigger: true
+      carry_data: true
+      condition: 'true'
+
+    # ResourcePlanner output kept for Synthesizer
+    - from: ResourcePlanner
+      to: Synthesizer
+      trigger: false
+      carry_data: true
+      keep_message: true
+      condition: 'true'
+
+    - from: PromptCriticStep6
+      to: Critic
+      trigger: true
+      carry_data: true
+      condition: 'true'
+
+    # ════════════════════════════════════════════════════════
+    # Phase 5: Synthesis → Refinement Advisor
+    # ════════════════════════════════════════════════════════
+
+    - from: PromptSynthesize
+      to: Synthesizer
+      trigger: true
+      carry_data: true
+      condition: 'true'
+
+    # Synthesizer → RefinementAdvisor (NOT directly to FINAL)
+    - from: Synthesizer
+      to: RefinementAdvisor
+      trigger: true
+      carry_data: true
+      condition: 'true'
+
+    # ════════════════════════════════════════════════════════
+    # Phase 6: Refinement loop (long-horizon)
+    # ════════════════════════════════════════════════════════
+
+    # RefinementAdvisor decides: finalize or offer refinement
+
+    # If final → FINAL
+    - from: RefinementAdvisor
+      to: FINAL
+      trigger: true
+      carry_data: true
+      condition:
+        type: keyword
+        config:
+          any:
+            - 'ROUTE: FINAL'
+          none: []
+          regex: []
+          case_sensitive: true
+
+    # If refinement → HumanFeedback (pause for user input)
+    - from: RefinementAdvisor
+      to: HumanFeedback
+      trigger: true
+      carry_data: true
+      condition:
+        type: keyword
+        config:
+          any:
+            - 'ROUTE: HumanFeedback'
+          none: []
+          regex: []
+          case_sensitive: true
+
+    # HumanFeedback → RefinementLoopCounter → Facilitator (re-enter pipeline)
+    - from: HumanFeedback
+      to: RefinementLoopCounter
+      trigger: true
+      carry_data: true
+      condition: 'true'
+
+    # If user says DONE/APPROVE → go to FINAL
+    - from: HumanFeedback
+      to: FINAL
+      trigger: true
+      carry_data: true
+      condition:
+        type: keyword
+        config:
+          any:
+            - DONE
+            - APPROVE
+          none: []
+          regex: []
+          case_sensitive: false
+
+    # RefinementLoopCounter → PromptRefinementEntry → Facilitator (if budget remains)
+    - from: RefinementLoopCounter
+      to: PromptRefinementEntry
+      trigger: true
+      carry_data: true
+      condition: 'true'
+
+    - from: PromptRefinementEntry
+      to: Facilitator
+      trigger: true
+      carry_data: true
+      condition: 'true'
+
+    # RefinementLoopCounter exhausted → force FINAL
+    - from: RefinementLoopCounter
+      to: FINAL
+      trigger: true
+      carry_data: true
+      condition:
+        type: keyword
+        config:
+          any:
+            - REFINEMENT_LIMIT_REACHED
+          none: []
+          regex: []
+          case_sensitive: false
+
+    # ════════════════════════════════════════════════════════
+    # Budget exhaustion fallback (inner critic loop)
+    # ════════════════════════════════════════════════════════
+
+    # When CriticLoopCounter exhausts budget → force finalize via Synthesizer
+    - from: CriticLoopCounter
+      to: PromptSynthesize
+      trigger: true
+      carry_data: true
+      condition:
+        type: keyword
+        config:
+          any:
+            - BUDGET_EXHAUSTED
+          none: []
+          regex: []
+          case_sensitive: false
+
+  # ──────────────────────────────────────────────────────────
+  # Shared memory (persists across refinement iterations)
+  # ──────────────────────────────────────────────────────────
+
+  memory:
+    - name: SessionMemory
+      type: blackboard
+      config:
+        memory_path: auto
+        max_items: 500
+
+  initial_instruction: |-
+    Welcome to the Problem Solving Tool — powered by Tim Hurson's Productive Thinking Model.
+    This tool supports long-horizon iterative refinement: each output can be fed back as
+    input to deepen analysis, explore alternatives, or update plans.
+
+    ═══════════════════════════════════════════════════════
+    MODE A — FRESH START
+    ═══════════════════════════════════════════════════════
+    Provide your problem input in JSON format:
+
+    REQUIRED:
+    - problem_statement: Description of the problem to solve
+
+    OPTIONAL:
+    - context: Background information, symptoms, suspected causes
+    - constraints: List of constraints (will be classified as hard/soft internally)
+    - stakeholders: List of { name, role, interests, influence_level }
+    - resources_available: { people, tools, budget, etc. }
+    - risk_tolerance: "low" | "medium" | "high"
+    - time_horizon: Timeline for implementation
+    - success_definition: What success looks like
+    - domain: Problem domain label
+    - search_permission: true/false (enable web research for evidence)
+    - search_constraints: { recency_days, max_queries, max_sources }
+
+    ═══════════════════════════════════════════════════════
+    MODE B — REFINEMENT (long-horizon)
+    ═══════════════════════════════════════════════════════
+    Paste a previous session output JSON, then add your refinement instructions:
+    - "Add constraint: no new hires"
+    - "Explore solutions that don't require engineering"
+    - "Update timeline to 3 months instead of 6 weeks"
+    - "The selected solution won't work because X — find alternatives"
+
+    The system will carry forward what's still valid, update what changed,
+    and re-run only the steps that need updating.
+
+    After each pass, you'll be asked if you want to refine further or finalize.
+    Type "DONE" at any feedback prompt to accept the current output.
+
+  start:
+    - START
+  end:
+    - FINAL
