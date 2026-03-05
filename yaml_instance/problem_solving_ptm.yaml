@@ -1,8 +1,5 @@
 version: 0.4.0
 vars:
-  MODEL_NAME: ${MODEL_NAME}
-  BASE_URL: ${BASE_URL}
-  API_KEY: ${API_KEY}
   ENABLE_SEARCH: 'true'
   MAX_SEARCH_QUERIES: '4'
   MAX_SOURCES: '3'
