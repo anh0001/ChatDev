@@ -497,6 +497,8 @@ graph:
           - Build in decision points where the team can pivot or stop
           - Keep tasks specific enough to be assignable
           - Include measurement at every phase boundary
+          - Task dependencies (depends_on[]) MUST form a directed acyclic graph (DAG) — no circular dependencies allowed. Before finalizing, verify no task transitively depends on itself.
+          - Budget allocations MUST explicitly account for the full stated budget. If the sum of categories is less than the total, add a 'contingency' or 'unallocated' line item so numbers sum to the stated cap.
 
           OUTPUT FORMAT:
           ## Step 6: Execution Plan
@@ -589,6 +591,7 @@ graph:
             * medium: mixed evidence, several untested assumptions
             * low: thin evidence, many untested assumptions, budget exhaustion occurred, or no citations
           - If Critic flagged issues that were not resolved, note them in open_questions
+          - Validate: claim_ledger entries referenced by the selected_solution must be contextually consistent with it (e.g., claims about entity X should not support a solution targeting entity Y). Flag mismatches in open_questions.
 
           OUTPUT:
           Emit ONLY the final JSON object. No commentary before or after.
@@ -695,6 +698,7 @@ graph:
           AFTER STEP 6 (Resource Planner output):
           - Is the plan feasible within stated constraints?
           - Are task dependencies logical?
+          - Are task dependencies acyclic? (Verify no circular depends_on chains where Task A → Task B → Task A, directly or transitively.)
           - Are measurement checkpoints meaningful?
           - Are risks properly identified with actionable mitigations?
           - Are assumptions flagged with validation plans?
@@ -723,6 +727,12 @@ graph:
           - Selected solution violates a hard constraint
           - Execution plan exceeds stated time horizon or resource budget
           - Critical evidence gaps on high-risk claims (when search is enabled)
+          - Any issue you label as "Critical" severity (regardless of checkpoint)
+
+          SEVERITY-ROUTING RULE:
+          If you label ANY issue as "Critical", you MUST use a FAIL route.
+          PASS is only allowed when ALL issues are "Minor" or "Suggestion",
+          OR you are in budget exhaustion mode (3rd review for same checkpoint).
 
           AUTO-PASS CONDITIONS:
           - If this is the 3rd review iteration for the same checkpoint, issue PASS
@@ -1086,6 +1096,14 @@ graph:
     # Critic routing — keyword-based step-aware dispatch
     # ════════════════════════════════════════════════════════
 
+    # Critic reviews kept for Synthesizer (all checkpoints)
+    - from: Critic
+      to: Synthesizer
+      trigger: false
+      carry_data: true
+      keep_message: true
+      condition: 'true'
+
     # ── PASS routes (each goes to the next step) ──
 
     # After Steps 1-3 PASS → Ideator (Step 4)
@@ -1370,12 +1388,35 @@ graph:
           regex: []
           case_sensitive: true
 
-    # HumanFeedback → RefinementLoopCounter → Facilitator (re-enter pipeline)
+    # HumanFeedback → PromptRefinementEntry → Facilitator (re-enter pipeline)
+    - from: HumanFeedback
+      to: PromptRefinementEntry
+      trigger: true
+      carry_data: true
+      condition:
+        type: keyword
+        config:
+          any: []
+          none:
+            - DONE
+            - APPROVE
+          regex: []
+          case_sensitive: false
+
+    # HumanFeedback also increments RefinementLoopCounter (limit guard only)
     - from: HumanFeedback
       to: RefinementLoopCounter
       trigger: true
       carry_data: true
-      condition: 'true'
+      condition:
+        type: keyword
+        config:
+          any: []
+          none:
+            - DONE
+            - APPROVE
+          regex: []
+          case_sensitive: false
 
     # If user says DONE/APPROVE → go to FINAL
     - from: HumanFeedback
@@ -1392,13 +1433,7 @@ graph:
           regex: []
           case_sensitive: false
 
-    # RefinementLoopCounter → PromptRefinementEntry → Facilitator (if budget remains)
-    - from: RefinementLoopCounter
-      to: PromptRefinementEntry
-      trigger: true
-      carry_data: true
-      condition: 'true'
-
+    # PromptRefinementEntry → Facilitator
     - from: PromptRefinementEntry
       to: Facilitator
       trigger: true
