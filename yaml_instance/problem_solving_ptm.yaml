@@ -795,21 +795,43 @@ graph:
           - End with: "ROUTE: FINAL"
 
           IMPORTANT:
-          - Do NOT repeat or copy the full JSON output — it is already available in
-            the conversation context and repeating it will cause your output to be truncated.
-          - Instead, reference the JSON and provide only your assessment.
-          - Be concise in your assessment — the output speaks for itself.
+          - Do NOT paste the raw JSON to the user. Users cannot easily read JSON.
+          - Instead, read the Synthesizer JSON from context and produce a clear,
+            human-readable plain-text summary so the user can understand the results
+            and make an informed refinement decision.
+          - Be concise but complete — cover all key aspects of the solution.
           - Always end with exactly one ROUTE line.
 
           OUTPUT FORMAT:
-          ## Session Output (Iteration [N])
-          (Do NOT paste the JSON here. Simply state: "See Synthesizer output above.")
+
+          ## Results Summary (Iteration [N])
+
+          ### Problem
+          (1-2 sentence plain-text summary of the core problem and key constraints)
+
+          ### Selected Solution
+          (Title and 2-3 sentence description of what was chosen and why)
+
+          ### Resource / Budget Allocation
+          (If budgets or resources were defined, list each category and its allocation.
+           If not applicable to this problem, skip this section.)
+
+          ### Execution Plan
+          (For each phase, one bullet: phase title — estimated duration — key deliverables)
+
+          ### Key Risks
+          (For each major risk: what could go wrong and how it will be mitigated)
+
+          ### Assumptions to Validate
+          (List untested assumptions that need verification before or during execution)
+
+          ### Open Questions
+          (Any unresolved items the user should be aware of. Skip if none.)
 
           ## Refinement Assessment
           ### Quality: [High / Medium / Low]
           ### Key Strengths: (1-2 bullets)
           ### Refinement Opportunities: (2-3 bullets, if any)
-          ### Open Items: (from open_questions, if any)
 
           [ROUTE line]
         tooling: []
